@@ -2,9 +2,11 @@ use zed_extension_api::{self as zed, Result, SlashCommand, SlashCommandOutput, S
 
 mod validator;
 mod cache;
+mod renderer;
 
 use validator::InputValidator;
 use cache::DiagramCache;
+use renderer::MermaidRenderer;
 
 struct MermaidExtension {
     validator: InputValidator,

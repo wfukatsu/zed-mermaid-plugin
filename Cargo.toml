@@ -28,6 +28,11 @@ tokio = { version = "1.0", default-features = false, features = ["sync"] }
 anyhow = "1.0"
 thiserror = "1.0"
 
+# Mermaid rendering (Git dependency - not yet on crates.io)
+# NOTE: This will be added when we integrate real rendering
+# For MVP, we'll use a mock renderer
+# mermaid-rs-renderer = { git = "https://github.com/1jehuang/mermaid-rs-renderer", default-features = false }
+
 [dev-dependencies]
 tempfile = "3.0"
 

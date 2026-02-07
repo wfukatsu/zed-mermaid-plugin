@@ -1,10 +1,18 @@
 use zed_extension_api::{self as zed, Result, SlashCommand, SlashCommandOutput, SlashCommandOutputSection};
 
-struct MermaidExtension;
+mod validator;
+
+use validator::InputValidator;
+
+struct MermaidExtension {
+    validator: InputValidator,
+}
 
 impl zed::Extension for MermaidExtension {
     fn new() -> Self {
-        Self
+        Self {
+            validator: InputValidator::new(),
+        }
     }
 
     fn run_slash_command(

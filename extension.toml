@@ -1,0 +1,15 @@
+id = "mermaid-preview"
+name = "Mermaid Preview"
+description = "Preview Mermaid diagrams with native Rust rendering and LSP validation"
+version = "0.1.0"
+schema_version = 1
+authors = ["Your Name <you@example.com>"]
+repository = "https://github.com/yourusername/zed-mermaid-plugin"
+
+[slash_commands.mermaid-preview]
+description = "Render Mermaid diagram to SVG"
+requires_argument = false
+
+[language_servers.mermaid]
+name = "Mermaid Language Server"
+language = "mermaid"

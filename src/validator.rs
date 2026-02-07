@@ -37,8 +37,9 @@ static ALLOWED_CHARS_REGEX: OnceLock<Regex> = OnceLock::new();
 fn get_allowed_chars_regex() -> &'static Regex {
     ALLOWED_CHARS_REGEX.get_or_init(|| {
         // Whitelist: alphanumeric, whitespace, and safe punctuation
-        // Excludes shell metacharacters like ; $ ` | & > < etc.
-        Regex::new(r"^[a-zA-Z0-9\s\-_\[\]\(\)\{\}:,\.\n\r\t]+$")
+        // Includes > < for Mermaid arrows (-->, <--, etc.)
+        // Excludes dangerous shell metacharacters like ; $ ` | & etc.
+        Regex::new(r"^[a-zA-Z0-9\s\-_\[\]\(\)\{\}:,\.\n\r\t<>]+$")
             .expect("Valid regex pattern")
     })
 }
@@ -140,13 +141,13 @@ mod tests {
         let validator = InputValidator::new();
 
         // Test various shell metacharacters
+        // Note: > and < are allowed for Mermaid arrows, but other shell metacharacters are blocked
         let dangerous_inputs = vec![
-            "graph TD; rm -rf /",
-            "graph TD\n    A[`whoami`]",
-            "graph TD\n    A[$SHELL]",
-            "graph TD\n    A[test | grep]",
-            "graph TD\n    A[test & bg]",
-            "graph TD\n    A[test > file]",
+            "graph TD; rm -rf /",  // semicolon
+            "graph TD\n    A[`whoami`]",  // backticks
+            "graph TD\n    A[$SHELL]",  // dollar sign
+            "graph TD\n    A[test | grep]",  // pipe
+            "graph TD\n    A[test & bg]",  // ampersand
         ];
 
         for input in dangerous_inputs {

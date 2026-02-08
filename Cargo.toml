@@ -1,0 +1,28 @@
+[package]
+name = "mermaid-preview"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[lib]
+path = "src/lib.rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+zed_extension_api = "0.1.0"
+anyhow = "1.0"
+which = "6.0"      # For finding mmdc executable
+tempfile = "3.0"   # For temporary files during rendering
+
+[dev-dependencies]
+tempfile = "3.0"
+
+[profile.release]
+opt-level = "z"     # Optimize for size
+lto = true          # Enable link-time optimization
+codegen-units = 1   # Better optimization
+strip = true        # Strip symbols
+panic = "abort"     # Smaller binary
+
+[profile.release.package."*"]
+opt-level = "z"     # Optimize dependencies for size

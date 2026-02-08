@@ -1,6 +1,6 @@
 id = "mermaid-preview"
 name = "Mermaid Preview"
-description = "Preview Mermaid diagrams with native Rust rendering"
+description = "Preview Mermaid diagrams with CLI rendering"
 version = "0.1.0"
 schema_version = 1
 authors = ["wfukatsu <wfukatsu@example.com>"]

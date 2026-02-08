@@ -1,272 +1,259 @@
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::{env, fs, path::PathBuf};
 use zed_extension_api::{
-    self as zed, Result, SlashCommand, SlashCommandOutput, SlashCommandOutputSection,
+    self as zed, Architecture, DownloadedFileType, LanguageServerId, Os, Result,
 };
 
-/// Main extension struct
-struct MermaidExtension {
-    cache_dir: PathBuf,
+const GITHUB_REPOSITORY: &str = "dawsh2/zed-mermaid-preview";
+const CACHE_ROOT: &str = "mermaid-lsp-cache";
+
+struct MermaidPreviewExtension {
+    lsp_path: Option<String>,
 }
 
-impl MermaidExtension {
-    /// Handle /mermaid-preview command
-    fn handle_preview(&self, args: Vec<String>) -> Result<SlashCommandOutput> {
-        if args.is_empty() {
-            return Err(
-                "No Mermaid source provided. Usage: /mermaid-preview <mermaid code>".to_string(),
-            );
-        }
-
-        // Join all arguments to get full source
-        let source = args.join(" ");
-
-        // Validate input
-        validate_mermaid_source(&source)?;
-        validate_no_html_injection(&source)?;
-
-        // Check cache
-        let key = cache_key(&source);
-        let cached_path = cache_path(&self.cache_dir, &key);
-
-        if cached_path.exists() {
-            return self.output_success(&cached_path, true);
-        }
-
-        // Render via CLI
-        let svg = render_via_cli(&source)?;
-
-        // Sanitize SVG (TODO: Add ammonia crate for production)
-        let safe_svg = svg; // Will add sanitization in security hardening phase
-
-        // Write to cache
-        std::fs::create_dir_all(&self.cache_dir)
-            .map_err(|e| format!("Failed to create cache directory: {}", e))?;
-        std::fs::write(&cached_path, safe_svg)
-            .map_err(|e| format!("Failed to write cache: {}", e))?;
-
-        self.output_success(&cached_path, false)
+impl zed::Extension for MermaidPreviewExtension {
+    fn new() -> Self {
+        Self { lsp_path: None }
     }
 
-    /// Output success message with path
-    fn output_success(&self, path: &Path, from_cache: bool) -> Result<SlashCommandOutput> {
-        let cache_note = if from_cache {
-            " (from cache)"
-        } else {
-            ""
-        };
+    fn language_server_command(
+        &mut self,
+        language_server_id: &LanguageServerId,
+        worktree: &zed::Worktree,
+    ) -> Result<zed::Command> {
+        let lsp_path = self.get_lsp_path(worktree, language_server_id)?;
+        eprintln!("Starting Mermaid LSP at: {lsp_path}");
 
-        let text = format!(
-            "✅ Diagram rendered successfully{}\n\n\
-             Preview: {}\n\n\
-             Open with your system viewer (Preview.app on macOS).",
-            cache_note,
-            path.display()
-        );
-
-        Ok(SlashCommandOutput {
-            text: text.clone(),
-            sections: vec![SlashCommandOutputSection {
-                range: (0..text.len()).into(),
-                label: "Mermaid Preview".to_string(),
-            }],
+        Ok(zed::Command {
+            command: lsp_path,
+            args: vec![],
+            env: Default::default(),
         })
     }
 }
 
-impl zed::Extension for MermaidExtension {
-    fn new() -> Self {
-        let cache_dir = std::env::var("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(".cache")
-            .join("zed")
-            .join("mermaid");
+impl MermaidPreviewExtension {
+    fn get_lsp_path(
+        &mut self,
+        worktree: &zed::Worktree,
+        language_server_id: &LanguageServerId,
+    ) -> Result<String> {
+        if let Some(ref path) = self.lsp_path {
+            return Ok(path.clone());
+        }
 
-        Self { cache_dir }
+        let extension_dir = env::current_dir()
+            .map_err(|e| format!("Failed to get current directory: {e}"))?;
+
+        self.resolve_lsp_path(language_server_id, worktree, &extension_dir)
     }
 
-    fn run_slash_command(
-        &self,
-        command: SlashCommand,
-        args: Vec<String>,
-        _worktree: Option<&zed::Worktree>,
-    ) -> Result<SlashCommandOutput> {
-        match command.name.as_str() {
-            "mermaid-preview" => self.handle_preview(args),
-            cmd => Err(format!("unknown slash command: \"{}\"", cmd)),
+    fn resolve_lsp_path(
+        &mut self,
+        language_server_id: &LanguageServerId,
+        worktree: &zed::Worktree,
+        extension_dir: &std::path::Path,
+    ) -> Result<String> {
+        // 1. Check MERMAID_LSP_PATH environment variable
+        if let Ok(path) = env::var("MERMAID_LSP_PATH") {
+            let candidate = PathBuf::from(&path);
+            if candidate.is_file() {
+                return Self::finalize_path(language_server_id, candidate, &mut self.lsp_path);
+            }
+        }
+
+        // 2. Check worktree PATH
+        if let Some(path) = worktree.which("mermaid-lsp") {
+            return Self::finalize_path(
+                language_server_id,
+                PathBuf::from(path),
+                &mut self.lsp_path,
+            );
+        }
+
+        // 3. Check local candidate paths (bundled binaries)
+        let binary_name = Self::binary_name();
+        if let Some(path) = Self::candidate_paths(extension_dir, binary_name)
+            .into_iter()
+            .find(|p| p.is_file())
+        {
+            return Self::finalize_path(language_server_id, path, &mut self.lsp_path);
+        }
+
+        // 4. Download from GitHub Releases
+        match self.download_lsp(language_server_id, extension_dir, binary_name) {
+            Ok(path) if path.is_file() => {
+                Self::finalize_path(language_server_id, path, &mut self.lsp_path)
+            }
+            Err(e) => Err(format!("Failed to download LSP binary: {e}")),
+            _ => Err(format!(
+                "LSP binary '{binary_name}' not found. Set MERMAID_LSP_PATH or publish a GitHub release."
+            )),
+        }
+    }
+
+    fn finalize_path(
+        language_server_id: &LanguageServerId,
+        path: PathBuf,
+        cache: &mut Option<String>,
+    ) -> Result<String> {
+        let resolved = path
+            .canonicalize()
+            .unwrap_or(path)
+            .to_string_lossy()
+            .to_string();
+        *cache = Some(resolved.clone());
+
+        zed::set_language_server_installation_status(
+            language_server_id,
+            &zed::LanguageServerInstallationStatus::None,
+        );
+
+        Ok(resolved)
+    }
+
+    fn candidate_paths(extension_dir: &std::path::Path, binary_name: &str) -> Vec<PathBuf> {
+        let mut candidates = vec![
+            extension_dir.join(binary_name),
+            extension_dir.join("target/release").join(binary_name),
+            extension_dir.join("target/debug").join(binary_name),
+            extension_dir.join("bin").join(binary_name),
+            extension_dir.join("lsp/target/release").join(binary_name),
+        ];
+
+        // Check cached versions
+        let cache_root = extension_dir.join(CACHE_ROOT);
+        if let Ok(entries) = fs::read_dir(cache_root) {
+            for entry in entries.flatten() {
+                candidates.push(entry.path().join(binary_name));
+            }
+        }
+
+        candidates
+    }
+
+    fn download_lsp(
+        &mut self,
+        language_server_id: &LanguageServerId,
+        extension_dir: &std::path::Path,
+        binary_name: &str,
+    ) -> Result<PathBuf> {
+        zed::set_language_server_installation_status(
+            language_server_id,
+            &zed::LanguageServerInstallationStatus::CheckingForUpdate,
+        );
+
+        let release = zed::latest_github_release(
+            GITHUB_REPOSITORY,
+            zed::GithubReleaseOptions {
+                require_assets: true,
+                pre_release: false,
+            },
+        )?;
+
+        let asset = Self::match_asset(&release)?;
+        let version_dir = extension_dir.join(CACHE_ROOT).join(&release.version);
+        let binary_path = version_dir.join(binary_name);
+
+        // Already have this version
+        if binary_path.is_file() {
+            zed::set_language_server_installation_status(
+                language_server_id,
+                &zed::LanguageServerInstallationStatus::None,
+            );
+            return Ok(binary_path);
+        }
+
+        // Create cache directory
+        fs::create_dir_all(&version_dir)
+            .map_err(|e| format!("Failed to create cache directory: {e}"))?;
+
+        // Download
+        zed::set_language_server_installation_status(
+            language_server_id,
+            &zed::LanguageServerInstallationStatus::Downloading,
+        );
+
+        zed::download_file(
+            &asset.download_url,
+            version_dir
+                .to_str()
+                .ok_or_else(|| "Failed to stringify cache path".to_string())?,
+            DownloadedFileType::Zip,
+        )
+        .map_err(|e| format!("Failed to download mermaid-lsp: {e}"))?;
+
+        if !binary_path.is_file() {
+            return Err(format!(
+                "Downloaded asset '{}' did not contain expected binary '{binary_name}'",
+                asset.name
+            ));
+        }
+
+        zed::make_file_executable(
+            binary_path
+                .to_str()
+                .ok_or_else(|| "Failed to stringify binary path".to_string())?,
+        )?;
+
+        // Purge old versions
+        Self::purge_old_cache_versions(extension_dir, &release.version);
+
+        eprintln!("Mermaid LSP v{} installed", release.version);
+        Ok(binary_path)
+    }
+
+    fn match_asset(release: &zed::GithubRelease) -> Result<zed::GithubReleaseAsset> {
+        let (os, arch) = zed::current_platform();
+
+        let arch_str = match arch {
+            Architecture::Aarch64 => "aarch64",
+            Architecture::X86 => "x86",
+            Architecture::X8664 => "x86_64",
+        };
+
+        let os_str = match os {
+            Os::Mac => "apple-darwin",
+            Os::Linux => "unknown-linux-gnu",
+            Os::Windows => "pc-windows-msvc",
+        };
+
+        let expected = format!("mermaid-lsp-{arch_str}-{os_str}.zip");
+
+        release
+            .assets
+            .iter()
+            .find(|a| a.name == expected)
+            .cloned()
+            .ok_or_else(|| {
+                let available: Vec<_> = release.assets.iter().map(|a| a.name.as_str()).collect();
+                format!("No asset '{expected}' found. Available: {available:?}")
+            })
+    }
+
+    fn purge_old_cache_versions(extension_dir: &std::path::Path, keep_version: &str) {
+        let cache_root = extension_dir.join(CACHE_ROOT);
+        if let Ok(entries) = fs::read_dir(&cache_root) {
+            for entry in entries.flatten() {
+                if entry
+                    .path()
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|v| v != keep_version)
+                    .unwrap_or(false)
+                {
+                    let _ = fs::remove_dir_all(entry.path());
+                }
+            }
+        }
+    }
+
+    fn binary_name() -> &'static str {
+        if cfg!(target_os = "windows") {
+            "mermaid-lsp.exe"
+        } else {
+            "mermaid-lsp"
         }
     }
 }
 
-// ============================================================================
-// Validation Functions
-// ============================================================================
-
-/// Validate Mermaid source code
-fn validate_mermaid_source(source: &str) -> Result<()> {
-    // 1. Empty check
-    if source.trim().is_empty() {
-        return Err("Empty diagram source".to_string());
-    }
-
-    // 2. Size limit check (1MB)
-    if source.len() > 1_000_000 {
-        return Err(format!(
-            "Diagram too large: {} bytes (max 1MB)",
-            source.len()
-        ));
-    }
-
-    // 3. Line count check (5000 lines)
-    let line_count = source.lines().count();
-    if line_count > 5000 {
-        return Err(format!(
-            "Too many lines: {} (max 5000)",
-            line_count
-        ));
-    }
-
-    // 4. Basic syntax check - must start with diagram type
-    let valid_types = [
-        "graph",
-        "flowchart",
-        "sequenceDiagram",
-        "classDiagram",
-        "stateDiagram",
-        "erDiagram",
-        "journey",
-        "gantt",
-        "pie",
-        "gitGraph",
-        "mindmap",
-        "timeline",
-        "quadrantChart",
-        "requirementDiagram",
-        "zenuml",
-        "sankey",
-        "xyChart",
-        "block",
-    ];
-
-    let first_word = source
-        .split_whitespace()
-        .next()
-        .ok_or_else(|| "Invalid diagram: no content found".to_string())?;
-
-    if !valid_types.iter().any(|t| first_word.starts_with(t)) {
-        return Err(format!(
-            "Unknown diagram type: '{}'. Must start with: {}",
-            first_word,
-            valid_types.join(", ")
-        ));
-    }
-
-    Ok(())
-}
-
-/// Validate against XSS patterns
-fn validate_no_html_injection(source: &str) -> Result<()> {
-    let dangerous_patterns = [
-        "<script",
-        "javascript:",
-        "onerror=",
-        "onload=",
-        "<iframe",
-        "<embed",
-        "<object",
-    ];
-
-    let lower = source.to_lowercase();
-    for pattern in dangerous_patterns {
-        if lower.contains(pattern) {
-            return Err(format!("Blocked dangerous pattern: {}", pattern));
-        }
-    }
-
-    Ok(())
-}
-
-// ============================================================================
-// Cache Functions
-// ============================================================================
-
-/// Generate cache key from source
-fn cache_key(source: &str) -> String {
-    let mut hasher = DefaultHasher::new();
-    source.hash(&mut hasher);
-    format!("{:x}", hasher.finish())
-}
-
-/// Get cache file path
-fn cache_path(cache_dir: &Path, key: &str) -> PathBuf {
-    cache_dir.join(format!("{}.svg", key))
-}
-
-// ============================================================================
-// Renderer Function
-// ============================================================================
-
-/// Render Mermaid diagram via mmdc CLI
-fn render_via_cli(source: &str) -> Result<String> {
-    // Check if mmdc is installed
-    let mmdc_path = which::which("mmdc").map_err(|_| {
-        "Mermaid CLI (mmdc) not found.\n\n\
-         Install with:\n\
-         npm install -g @mermaid-js/mermaid-cli\n\n\
-         Then restart Zed."
-            .to_string()
-    })?;
-
-    // Create temporary files
-    let temp_dir = tempfile::tempdir()
-        .map_err(|e| format!("Failed to create temp directory: {}", e))?;
-
-    let input_path = temp_dir.path().join("input.mmd");
-    let output_path = temp_dir.path().join("output.svg");
-    let config_path = temp_dir.path().join("config.json");
-
-    // Write input file
-    std::fs::write(&input_path, source)
-        .map_err(|e| format!("Failed to write input file: {}", e))?;
-
-    // Write config file with strict security
-    let config = r#"{
-  "securityLevel": "strict",
-  "theme": "default"
-}"#;
-    std::fs::write(&config_path, config)
-        .map_err(|e| format!("Failed to write config file: {}", e))?;
-
-    // Spawn mmdc process
-    let output = Command::new(&mmdc_path)
-        .arg("-i")
-        .arg(&input_path)
-        .arg("-o")
-        .arg(&output_path)
-        .arg("-c")
-        .arg(&config_path)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|e| format!("Failed to execute mmdc: {}", e))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("Mermaid rendering failed:\n{}", stderr));
-    }
-
-    // Read SVG output
-    let svg = std::fs::read_to_string(&output_path)
-        .map_err(|e| format!("Failed to read rendered SVG: {}", e))?;
-
-    Ok(svg)
-}
-
-// ============================================================================
-// Extension Registration
-// ============================================================================
-
-zed::register_extension!(MermaidExtension);
+zed_extension_api::register_extension!(MermaidPreviewExtension);
